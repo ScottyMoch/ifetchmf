@@ -19,3 +19,7 @@ def can_read_file(item: Any) -> bool:
         )
     except AttributeError:
         return False
+
+def sanitize_filename(s: str) -> str:
+    return ''.join(c for c in s if c.isalnum() or c in "-_.() ")
+ 

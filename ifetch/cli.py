@@ -3,6 +3,8 @@ import sys
 import argparse
 from pathlib import Path
 
+from boolparser import BooleanAction
+
 # ---------------------------------------------------------------------------
 # Import DownloadManager whether this script is executed as a module inside
 # the ifetch package or run directly via `python ifetch/cli.py`.
@@ -83,9 +85,40 @@ def main():
         dest='profile_file',
         help='Custom path to a profile JSON file (overrides default ~/.ifetch_profiles.json)'
     )
+    
+
+    parser.add_argument(
+        '--archive',
+        #action='store_true',
+        action=BooleanAction, nargs='?', default=False, const=True,
+        dest='archive_files',
+        #default='false',
+        help='enable archiving of files for file versioning & rollback features'
+    )
+    parser.set_defaults(archive_files=False)
+
+    parser.add_argument(
+        '--use-delta-updates',
+        #action='store_true',
+        action=BooleanAction, nargs='?', default=False, const=True,
+        dest='use_delta_updates',
+        #default='false',
+        help='enable differential backups'
+    )
+    parser.set_defaults(use_delta_updates=False)
+
+    parser.add_argument(
+        '--resume-downloads',
+        #action='store_true',
+        action=BooleanAction, nargs='?', default=False, const=True,
+        dest='resume_downloads',
+        #default='false',
+        help='enable resumable downloads'
+    )
+    parser.set_defaults(resume_downloads=False)
 
     args = parser.parse_args()
-
+    
     try:
         # Create a progress banner
         print("=" * 70)
@@ -113,7 +146,10 @@ def main():
             max_retries=args.max_retries,
             chunk_size=args.chunk_size,
             include_patterns=include_pats,
-            exclude_patterns=exclude_pats
+            exclude_patterns=exclude_pats,
+            archive_files=args.archive_files,
+            use_delta_updates=args.use_delta_updates,
+            resume_downloads=args.resume_downloads
         )
 
         # Authenticate (will prompt for password if needed)

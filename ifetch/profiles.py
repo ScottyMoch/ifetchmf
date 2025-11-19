@@ -24,6 +24,8 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
+from json_minify import json_minify
+
 DEFAULT_PATH = Path.home() / ".ifetch_profiles.json"
 
 class ProfileManager:
@@ -40,7 +42,9 @@ class ProfileManager:
         if not self.config_path.exists():
             raise FileNotFoundError(f"Profile config not found at {self.config_path}")
         try:
-            data: Dict[str, Any] = json.loads(self.config_path.read_text())
+            filedata = self.config_path.read_text()
+            # data: Dict[str, Any] = json.loads(self.config_path.read_text())
+            data: Dict[str, Any] = json.loads(json_minify(filedata))
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in {self.config_path}: {e}") from e
 

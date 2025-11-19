@@ -1,5 +1,7 @@
-pyicloud
+pyicloud @ git+https://github.com/timlaing/pyicloud@main
 tqdm
 keyring
 pytest
 pytest-cov
+pathvalidate
+json-minify

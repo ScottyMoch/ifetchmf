@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from tqdm import tqdm
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -18,9 +19,11 @@ from .models import DownloadStatus
 from .chunker import FileChunker
 from .tracker import DownloadTracker
 from .utils import can_read_file
+from .utils import sanitize_filename
 from .plugin import PluginManager
 from .versioning import VersionManager
 
+from pathvalidate import sanitize_filepath
 
 class DownloadManager:
     """Enhanced iCloud file downloader with differential updates support."""
@@ -32,12 +35,19 @@ class DownloadManager:
         chunk_size: int = 1024 * 1024,
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
+        archive_files: bool = False,
+        use_delta_updates: bool = False,
+        resume_downloads: bool = False,
     ):
         self.email = email or os.environ.get('ICLOUD_EMAIL')
         if not self.email:
             raise ValueError(
                 "Email must be provided via argument or ICLOUD_EMAIL environment variable"
             )
+
+        self.archive_files = archive_files
+        self.use_delta_updates = use_delta_updates
+        self.resume_downloads = resume_downloads
 
         self.max_workers = max_workers
         self.max_retries = max_retries
@@ -240,7 +250,9 @@ class DownloadManager:
             }))
             return False
 
-        tracker = DownloadTracker(local_path)
+        if self.resume_downloads: tracker = DownloadTracker(local_path)
+        else: tracker = None
+
         temp_path: Optional[Path] = None
         total_size = 0
 
@@ -248,16 +260,21 @@ class DownloadManager:
             with self._open_with_retry(item) as response:
                 total_size = int(response.headers.get('content-length', 0))
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
-                existing_chunks = self.chunker.get_file_chunks(local_path)
+                if self.use_delta_updates:
+                    existing_chunks = self.chunker.get_file_chunks(local_path)
+                else:
+                    existing_chunks = [0,total_size - 1]    # the entire file
+
                 changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
 
-                if tracker.current_position > 0:
-                    resumed_ranges = []
-                    for start, end in changed_ranges:
-                        if end < tracker.current_position:
-                            continue
-                        resumed_ranges.append((max(start, tracker.current_position), end))
-                    changed_ranges = resumed_ranges
+                if tracker:
+                    if tracker.current_position > 0:
+                        resumed_ranges = []
+                        for start, end in changed_ranges:
+                            if end < tracker.current_position:
+                                continue
+                            resumed_ranges.append((max(start, tracker.current_position), end))
+                        changed_ranges = resumed_ranges
 
                 if not changed_ranges:
                     self.logger.info(json.dumps({
@@ -291,12 +308,19 @@ class DownloadManager:
                         f.seek(total_size - 1)
                         f.write(b'\0')
 
-                with temp_path.open('r+b') as out_file:
+                with temp_path.open('r+b') as out_file, tqdm(
+                    desc=f"Updating {item.name}",
+                    total=bytes_to_download,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024
+                ) as pbar:
                     for start, end in changed_ranges:
                         chunk = self.download_chunk(response.url, start, end, item=item)
                         out_file.seek(start)
                         out_file.write(chunk)
-                        tracker.save_status(end + 1)
+                        pbar.update(len(chunk))
+                        if tracker: tracker.save_status(end + 1)
 
                         # Streaming progress event (generic)
                         self.plugin_manager.dispatch(
@@ -328,7 +352,7 @@ class DownloadManager:
                     status="completed",
                     changes=len(changed_ranges)
                 ))
-                tracker.cleanup()
+                if tracker: tracker.cleanup()
                 # Update version metadata with new checksum
                 if self.version_manager:
                     new_checksum = temp_checksum
@@ -382,14 +406,17 @@ class DownloadManager:
     def process_item_parallel(self, item: Any, local_path: Path) -> None:
         """Process files and directories in parallel."""
         try:
-            # If file/dir is excluded by patterns, skip
-            rel_path = local_path.relative_to(self.root_path) if self.root_path else local_path
-            if not self._should_process(rel_path, is_dir=False if can_read_file(item) else True):
-                return
 
+            sanitized_local_path = sanitize_filepath(local_path)
+
+            # If file/dir is excluded by patterns, skip
+            rel_path = local_path.relative_to(self.root_path) if self.root_path else sanitized_local_path
+            if not self._should_process(rel_path, is_dir=False if can_read_file(item) else True):
+               return
+            
             if can_read_file(item):
                 with self._download_lock:
-                    local_path_str = str(local_path)
+                    local_path_str = str(sanitized_local_path)
                     if local_path_str in self._active_downloads:
                         return
                     self._active_downloads.add(local_path_str)
@@ -397,19 +424,19 @@ class DownloadManager:
                 try:
                     # before_download hook
                     self.plugin_manager.dispatch(
-                        "before_download", remote_item=item, local_path=local_path
+                        "before_download", remote_item=item, sanitized_local_path=sanitized_local_path
                     )
-                    if self.download_drive_item(item, local_path):
+                    if self.download_drive_item(item, sanitized_local_path):
                         self.logger.info(json.dumps({
                             "event": "download_success",
                             "file": getattr(item, 'name', 'unknown'),
-                            "path": str(local_path)
+                            "path": str(sanitized_local_path)
                         }))
                     else:
                         self.logger.error(json.dumps({
                             "event": "download_failed",
                             "file": getattr(item, 'name', 'unknown'),
-                            "path": str(local_path)
+                            "path": str(sanitized_local_path)
                         }))
                 finally:
                     with self._download_lock:
@@ -557,7 +584,8 @@ class DownloadManager:
 
         # Initialise version manager for this download session
         self.root_path = local_path_obj
-        self.version_manager = VersionManager(local_path_obj)
+        if self.archive_files:
+            self.version_manager = VersionManager(local_path_obj)
 
         item = self.get_drive_item(icloud_path)
 
@@ -594,6 +622,10 @@ class DownloadManager:
                 return False
 
         # Include logic: if include list empty -> include all; else must match one
+        # add this to get thru the top level?
+        if path_str == '.':
+            return True
+
         if not self.include_patterns:
             return True
         return any(fnmatch(path_str, pat) for pat in self.include_patterns)

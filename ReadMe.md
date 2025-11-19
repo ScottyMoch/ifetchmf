@@ -1,3 +1,45 @@
+
+# 2025-11-18 modifications
+
+### Separate the file management operations by arguments
+
+- --archive               use the Versioning Manager
+- --use-delta-updates     download files using chunks
+- --resume-downloads      interrupted downloads can be resumed
+
+    these arguments are boolean, valid values are :<br>
+        true, t, yes, y, 1  
+        false, f, no, n, 0  
+
+    argument specified by itself implies True<br>
+    argument values Default to False if not provided
+    
+
+
+### Additions
+- Destination filenames are sanitized<br>
+(Many filenames saved on the Apple device may contain characters that are invalid when saved to Window's systems)
+- try using a new streaming class to operate chunks like a file; ResponseStream<br>
+(response.raw.seek() & .tell() were returnging 'unsupported' errors)
+- The Profile JSON files may contain comments, parsed out during loadtime by json_minify()
+
+
+### Future Additions
+
+- Allow commandline arguments to be parsed from the json profile file
+- compare and/or incorporate mods from skyerday fork
+
+
+### Long Range Additions/Considerations
+- integrate the after-download plugin feature with the <br>
+RFFrasca PDFKeeper app on Window's systems
+- use the Keyring integration with the 1password CLI<br>
+(https://github.com/falling-springs/onepassword-keyring )
+- 
+<br/>
+
+____
+
 # iFetch
 
 A robust Python utility for efficiently downloading files and folders from iCloud Drive, designed for bulk data recovery and migration. This tool helps users easily retrieve their data from iCloud Drive when Apple's native solutions are insufficient.

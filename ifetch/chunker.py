@@ -43,6 +43,20 @@ class FileChunker:
 
         return chunks
 
+    def _build_ranges(self, total_size: int, start_offset: int = 0) -> List[Tuple[int, int]]:
+        """Build contiguous byte ranges using configured chunk size."""
+        if total_size <= 0 or start_offset >= total_size:
+            return []
+
+        ranges: List[Tuple[int, int]] = []
+        start = max(0, start_offset)
+        while start < total_size:
+            end = min(start + self.chunk_size - 1, total_size - 1)
+            ranges.append((start, end))
+            start = end + 1
+
+        return ranges
+
     def find_changed_chunks(
         self,
         response: Any,
@@ -71,7 +85,7 @@ class FileChunker:
 
         # If no local file exists, download everything
         if not existing_chunks:
-            return [(0, total_size - 1)]
+            return self._build_ranges(total_size)
 
         # Compare file sizes - if local file exists and matches remote size, skip
         if local_path and local_path.exists():
@@ -79,6 +93,9 @@ class FileChunker:
             if local_size == total_size:
                 # File sizes match - assume unchanged
                 return []
+            if 0 < local_size < total_size:
+                # Resume from the already-downloaded prefix
+                return self._build_ranges(total_size, start_offset=local_size)
 
         # Sizes differ or can't compare - download everything
-        return [(0, total_size - 1)]
+        return self._build_ranges(total_size)

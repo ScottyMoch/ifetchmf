@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from tqdm import tqdm
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -157,7 +156,7 @@ class DownloadManager:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
-    def download_chunk(self, url: str, start: int, end: int) -> bytes:
+    def download_chunk(self, url: str, start: int, end: int, item: Any = None) -> bytes:
         """Download a specific byte range with retries and backoff."""
         headers = {'Range': f'bytes={start}-{end}'}
         retries = 0
@@ -169,6 +168,24 @@ class DownloadManager:
                 resp.raise_for_status()  # Raise error for non-200/206 status codes
                 if resp.status_code in (200, 206):
                     return resp.content
+            except requests.HTTPError as e:
+                last_error = e
+                status = e.response.status_code if e.response is not None else None
+                if status in (404, 410) and item is not None:
+                    # Signed URL likely expired; refresh and retry.
+                    try:
+                        with self._open_with_retry(item, max_retries=1) as refreshed:
+                            url = refreshed.url
+                    except Exception:
+                        pass
+                retries += 1
+                retry_after = None
+                if e.response is not None:
+                    retry_after = e.response.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    time.sleep(min(int(retry_after), 60))
+                else:
+                    time.sleep(2 ** retries)  # Exponential backoff
             except requests.RequestException as e:
                 last_error = e
                 retries += 1
@@ -176,8 +193,11 @@ class DownloadManager:
 
         raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
 
-    def _open_with_retry(self, item: Any, max_retries: int = 3) -> Any:
+    def _open_with_retry(self, item: Any, max_retries: Optional[int] = None) -> Any:
         """Open item with retry logic for transient connection errors."""
+        if max_retries is None:
+            max_retries = self.max_retries
+
         last_error = None
         for attempt in range(max_retries):
             try:
@@ -227,8 +247,17 @@ class DownloadManager:
         try:
             with self._open_with_retry(item) as response:
                 total_size = int(response.headers.get('content-length', 0))
+                temp_path = local_path.with_suffix(local_path.suffix + '.temp')
                 existing_chunks = self.chunker.get_file_chunks(local_path)
                 changed_ranges = self.chunker.find_changed_chunks(response, existing_chunks, local_path)
+
+                if tracker.current_position > 0:
+                    resumed_ranges = []
+                    for start, end in changed_ranges:
+                        if end < tracker.current_position:
+                            continue
+                        resumed_ranges.append((max(start, tracker.current_position), end))
+                    changed_ranges = resumed_ranges
 
                 if not changed_ranges:
                     self.logger.info(json.dumps({
@@ -239,7 +268,6 @@ class DownloadManager:
                     return True
 
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
-                temp_path = local_path.with_suffix(local_path.suffix + '.temp')
 
                 # Backup current file before modifications for rollback/versioning
                 if local_path.exists() and self.version_manager:
@@ -253,7 +281,9 @@ class DownloadManager:
                 # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
-                if local_path.exists():
+                if temp_path.exists():
+                    pass  # Reuse existing temp file for resumed download
+                elif local_path.exists():
                     shutil.copy2(local_path, temp_path)
                 else:
                     # Initialize the temp file with zeros
@@ -261,18 +291,11 @@ class DownloadManager:
                         f.seek(total_size - 1)
                         f.write(b'\0')
 
-                with temp_path.open('r+b') as out_file, tqdm(
-                    desc=f"Updating {item.name}",
-                    total=bytes_to_download,
-                    unit='B',
-                    unit_scale=True,
-                    unit_divisor=1024
-                ) as pbar:
+                with temp_path.open('r+b') as out_file:
                     for start, end in changed_ranges:
-                        chunk = self.download_chunk(response.url, start, end)
+                        chunk = self.download_chunk(response.url, start, end, item=item)
                         out_file.seek(start)
                         out_file.write(chunk)
-                        pbar.update(len(chunk))
                         tracker.save_status(end + 1)
 
                         # Streaming progress event (generic)
@@ -338,13 +361,11 @@ class DownloadManager:
                 "traceback": traceback.format_exc()
             }))
             if temp_path and temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError as unlink_error:
-                    self.logger.error(json.dumps({
-                        "event": "temp_file_cleanup_error",
-                        "error": str(unlink_error)
-                    }))
+                self.logger.warning(json.dumps({
+                    "event": "temp_file_retained",
+                    "file": getattr(item, 'name', 'unknown'),
+                    "path": str(temp_path)
+                }))
 
             self.download_results.append(DownloadStatus(
                 path=str(local_path),
